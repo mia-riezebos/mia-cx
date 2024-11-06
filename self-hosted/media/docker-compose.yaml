@@ -1,0 +1,513 @@
+x-common: &common
+  ### Common ###
+  # https://docs.docker.com/reference/compose-file/configs/
+  #
+  # The common extension is used to set options that are shared across services in the stack.
+  environment: &env
+    PUID: "1004"
+    PGID: "1005"
+    UMASK: "022"
+    UMASK_SET: "022"
+    TZ: "Europe/Amsterdam"
+
+services:
+
+  ### Network ###
+
+  # FlareSolverr
+  #   https://github.com/FlareSolverr/FlareSolverr/blob/master/docker-compose.yml
+  #
+  #   ports:
+  #     - '8191:8191'
+  flaresolverr:
+  # DockerHub mirror flaresolverr/flaresolverr:latest
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    environment:
+      <<: *env
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      LOG_HTML: "${LOG_HTML:-false}"
+      CAPTCHA_SOLVER: "hcaptcha-solver"
+    volumes:
+      - './flaresolverr/config:/config'
+      - './flaresolverr/captcha:/captcha'
+    ports:
+      - '8191:8191'
+    restart: unless-stopped
+
+  # Privoxy
+  #   https://hub.docker.com/r/vimagick/privoxy
+  #
+  #   ports:
+  #     - '8118:8118'
+  privoxy:
+    image: vimagick/privoxy
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      # make sure to create (touch) these files before running this container
+      - ./privoxy/user.action:/etc/privoxy/user.action
+      - ./privoxy/user.filter:/etc/privoxy/user.filter
+    ports:
+      - '8118:8118'
+    restart: unless-stopped
+
+  # WireGuard
+  #   https://github.com/linuxserver/docker-wireguard
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      <<: *env
+    volumes:
+      - ./wireguard/config:/config
+      - /lib/modules:/lib/modules #optional
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    restart: unless-stopped
+
+  ### Storage ###
+
+  # MergerFS
+  #   https://github.com/hvalev/mergerfs-docker
+  mergerfs:
+    image: hvalev/mergerfs:latest
+    container_name: mergerfs_media
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    environment:
+      <<: *env
+      MERGERFS_PARAMS: "cache.files=partial,dropcacheonclose=true,category.create=mfs,noforget,inodecalc=path-hash"
+    devices:
+      - /dev/fuse:/dev/fuse
+    volumes:
+      - sdc1:/disks/sdc1
+      - sdd1:/disks/sdd1
+      - /mnt/media:/merged:shared
+
+  # NFS Server (Media)
+  #   https://hub.docker.com/r/gists/nfs-server
+  #
+  #   ports:
+  #     - '2049:2049'
+  nfs_media:
+    image: gists/nfs-server
+    container_name: nfs_media
+    depends_on:
+      - mergerfs
+    networks:
+      - default
+    privileged: true
+    environment:
+      <<: *env
+      NFS_DIR: "/mnt/media"
+      NFS_DOMAIN: "10.0.0.0/16"
+      NFS_OPTION: "fsid=0,rw,sync,insecure,all_squash,anonuid=1004,anongid=1005,no_subtree_check,nohide"
+    volumes:
+      - media:/mnt/media
+    ports:
+      - 2049:2049
+    restart: unless-stopped
+
+  # NFS Server (Downloads)
+  #   https://hub.docker.com/r/gists/nfs-server
+  #
+  #   ports:
+  #     - '2050:2049'
+  nfs_downloads:
+    image: gists/nfs-server
+    container_name: nfs_downloads
+    depends_on:
+      - mergerfs
+    networks:
+      - default
+    privileged: true
+    environment:
+      <<: *env
+      NFS_DIR: "/mnt/downloads"
+      NFS_DOMAIN: "10.0.0.0/16"
+      NFS_OPTION: "fsid=0,rw,sync,insecure,all_squash,anonuid=1004,anongid=1005,no_subtree_check,nohide"
+    volumes:
+      - downloads:/mnt/downloads
+    ports:
+      - 2050:2049
+    restart: unless-stopped
+
+  ### Automation (*arr) ###
+
+  # Bazarr (subtitles)
+  #   https://docs.linuxserver.io/images/docker-bazarr
+  #
+  #   ports:
+  #     - '6767:6767'
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: media_bazarr
+    depends_on:
+      - mergerfs
+    networks:
+      - default
+      - proxy
+    environment:
+      <<: *env
+    volumes:
+      - downloads:/mnt/downloads
+      - media:/mnt/media
+      - ./bazarr/config:/config
+    ports:
+      - '6767:6767'
+    restart: unless-stopped
+
+  # Lidarr (music)
+  #   https://docs.linuxserver.io/images/docker-lidarr
+  #
+  #   ports:
+  #     - '8686:8686'
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: media_lidarr
+    depends_on:
+      - mergerfs
+    networks:
+      - default
+      - proxy
+    environment:
+      <<: *env
+    volumes:
+      - downloads:/mnt/downloads
+      - media:/mnt/media
+      - ./lidarr/config:/config
+    ports:
+      - '8686:8686'
+    restart: unless-stopped
+
+  # Prefetcharr
+  prefetcharr:
+    image: phueber/prefetcharr:latest
+    depends_on:
+      - sonarr
+      - jellyfin
+    environment:
+      # `jellyfin`, `emby` or `plex`
+      - MEDIA_SERVER_TYPE=jellyfin
+      # Jellyfin/Emby/Plex baseurl
+      - MEDIA_SERVER_URL=http://jellyfin:8096
+      # Jellyfin/Emby API key or plex server token
+      - MEDIA_SERVER_API_KEY=<redacted>
+      # Sonarr baseurl
+      - SONARR_URL=http://sonarr:8989
+      # Sonarr API key
+      - SONARR_API_KEY=<redacted>
+      # Logging directory
+      - LOG_DIR=/log
+      # Log level
+      - RUST_LOG=prefetcharr=debug
+      # Polling interval in seconds
+      - INTERVAL=300
+      # The last <NUM> episodes trigger a search
+      - REMAINING_EPISODES=6
+      # Optional: Only monitor sessions for specific user IDs or names
+      # - USERS=john,12345,alex
+    volumes:
+      - ./prefetcharr/log:/log
+
+  # Prowlarr (indexers)
+  #   https://docs.linuxserver.io/images/docker-prowlarr
+  #
+  #   ports:
+  #     - '9696:9696'
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: media_prowlarr
+    depends_on:
+      - flaresolverr
+      - privoxy
+    networks:
+      - default
+      - proxy
+    environment:
+      <<: *env
+    volumes:
+      - ./prowlarr/config:/config
+    ports:
+      - '9696:9696'
+    restart: unless-stopped
+
+  # Radarr (movies)
+  #   https://docs.linuxserver.io/images/docker-radarr
+  #
+  #   ports:
+  #     - '7878:7878'
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: media_radarr
+    depends_on:
+      - mergerfs
+    networks:
+      - default
+      - proxy
+    environment:
+      <<: *env
+    volumes:
+      - downloads:/mnt/downloads
+      - media:/mnt/media
+      - ./radarr/config:/config
+    ports:
+      - '7878:7878'
+    restart: unless-stopped
+
+  # Readarr (books)
+  #   https://docs.linuxserver.io/images/docker-readarr
+  #
+  #   ports:
+  #     - '8787:8787'
+  readarr:
+    image: lscr.io/linuxserver/readarr:develop
+    container_name: media_readarr
+    depends_on:
+      - mergerfs
+    networks:
+      - default
+      - proxy
+    environment:
+      <<: *env
+    volumes:
+      - downloads:/mnt/downloads
+      - media:/mnt/media
+      - ./readarr/config:/config
+    ports:
+      - '8787:8787'
+    restart: unless-stopped
+
+  # Sonarr (tv)
+  #   https://docs.linuxserver.io/images/docker-sonarr
+  #
+  #   ports:
+  #     - '8989:8989'
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: media_sonarr
+    depends_on:
+      - mergerfs
+    networks:
+      - default
+      - proxy
+    environment:
+      <<: *env
+    volumes:
+      - downloads:/mnt/downloads
+      - media:/mnt/media
+      - ./sonarr/config:/config
+    ports:
+      - '8989:8989'
+    restart: unless-stopped
+
+  ### Download Clients ###
+
+  # qBittorrent
+  #   https://docs.linuxserver.io/images/docker-qbittorrent
+  #
+  #   ports:
+  #     - '5656:5656'
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    environment:
+      <<: *env
+      WEBUI_PORT: "5656" #optional
+    volumes:
+      - downloads:/mnt/downloads
+      - ./qbittorrent/config:/config
+    ports:
+      - '5656:5656'
+      - '6881:6881' #optional
+      - '6881:6881/udp' #optional
+    restart: unless-stopped
+
+  # SABnzbd
+  #   https://docs.linuxserver.io/images/docker-sabnzbd
+  #
+  #   ports:
+  #     - '5757:8080'
+  sabnzbd:
+    image: lscr.io/linuxserver/sabnzbd:latest
+    environment:
+      <<: *env
+    volumes:
+      - downloads:/mnt/downloads
+      - ./sabnzbd/config:/config
+    ports:
+      - '5757:8080'
+    restart: unless-stopped
+
+  ### Requesters ###
+
+  # Ombi
+  #   https://docs.linuxserver.io/images/docker-ombi
+  #
+  #   ports:
+  #     - '3579:3579'
+  ombi:
+    image: lscr.io/linuxserver/ombi:latest
+    container_name: media_ombi
+    depends_on:
+      - jellyfin
+      - radarr
+      - sonarr
+      - lidarr
+    networks:
+      - default
+      - proxy
+    environment:
+      <<: *env
+    volumes:
+      - ./ombi/config:/config
+    ports:
+      - '3579:3579'
+
+  ### Transcoding ###
+
+  # Tdarr
+  #   https://docs.tdarr.io/docs/installation/docker/run-compose
+  #
+  #   ports:
+  #     - '8265:8265'
+  tdarr:
+    image: ghcr.io/haveagitgat/tdarr:latest
+    depends_on:
+      - mergerfs
+    environment:
+      <<: *env
+      serverIP: "0.0.0.0"
+      serverPort: "8266"
+      webUIPort: "8265"
+      internalNode: "false"
+    volumes:
+      - ./tdarr/cache:/app/cache
+      - ./tdarr/server:/app/server
+      - ./tdarr/configs:/app/configs
+      - ./tdarr/logs:/app/logs
+      - downloads:/mnt/downloads
+      - media:/mnt/media
+    ports:
+      - '8265:8265'
+      - '8266:8266'
+    restart: unless-stopped
+
+  # Tdarr_node (example)
+  #   https://docs.tdarr.io/docs/installation/docker/run-compose
+  tdarr_node:
+    image: ghcr.io/haveagitgat/tdarr_node:latest
+    container_name: tdarr_node
+    depends_on:
+      - mergerfs
+    environment:
+      <<: *env
+      nodeName: "Hestia"
+      serverIP: "10.0.1.1"
+      serverPort: "8266"
+      webUIPort: "8265"
+      inContainer: "true"
+      ffmpegVersion: "6"
+    volumes:
+      - ./tdarr/cache:/app/cache
+      - ./tdarr/configs:/app/configs
+      - ./tdarr/logs:/app/logs
+      - downloads:/mnt/downloads
+      - media:/mnt/media
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  ### Media Servers ###
+
+  # Jellyfin
+  #   https://docs.linuxserver.io/images/docker-jellyfin
+  #
+  #   ports:
+  #     - '8096:8096'
+  #     - '8920:8920'
+  #     - '7359:7359/udp' #optional
+  #     - '1900:1900/udp' #optional
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: media_jellyfin
+    depends_on:
+      - mergerfs
+    networks:
+      - default
+      - proxy
+    environment:
+      <<: *env
+      JELLYFIN_PublishedServerUrl: "<redacted>" #optional
+    volumes:
+      - downloads:/mnt/downloads
+      - media:/mnt/media
+      - ./jellyfin:/config
+      - ./jellyfin/cache:/cache
+    ports:
+      - '8096:8096'
+      - '8920:8920'
+      - '7359:7359/udp' #optional
+      - '1900:1900/udp' #optional
+    restart: unless-stopped
+
+
+networks:
+  proxy:
+    name: 'proxy'
+    external: true
+
+  default:
+    enable_ipv6: false
+
+volumes:
+  downloads:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "/mnt/downloads"
+  media:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "/mnt/media"
+  sdc1:
+    # needed for mergerfs to work
+    name: sdc1
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "/mnt/sdc1"
+  sdd1:
+    # needed for mergerfs to work
+    name: sdd1
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "/mnt/sdd1"
+  nfs_downloads:
+    name: nfs_downloads
+    driver: local
+    driver_opts:
+      type: nfs4
+      o: "addr=10.0.1.1,rw,port=2050"
+      device: ":/"
+  nfs_media:
+    name: nfs_media
+    driver: local
+    driver_opts:
+      type: nfs4
+      o: "addr=10.0.1.1,rw,port=2049"
+      device: ":/"
